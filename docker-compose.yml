@@ -1,0 +1,97 @@
+# RIVA AI — local infrastructure and optional full-stack containers.
+#
+#   docker compose up -d db redis          # infrastructure only (recommended for local dev)
+#   docker compose --profile app up -d     # infrastructure + backend + worker + frontend
+#
+# Ports can be changed with RIVA_DB_PORT (default 5434) / RIVA_REDIS_PORT (6379) / RIVA_API_PORT (8100) / RIVA_WEB_PORT (3000).
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: riva-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-riva}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-riva_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-riva}
+    ports:
+      - "${RIVA_DB_PORT:-5434}:5432"
+    volumes:
+      - riva_pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-riva} -d ${POSTGRES_DB:-riva}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: riva-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${RIVA_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    profiles: ["app"]
+    build:
+      context: ./backend
+    container_name: riva-backend
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-riva}:${POSTGRES_PASSWORD:-riva_dev_password}@db:5432/${POSTGRES_DB:-riva}
+      REDIS_URL: redis://redis:6379/0
+      EMBEDDED_WORKER: "false"
+      STORAGE_DIR: /data/storage
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8100"]
+    ports:
+      - "${RIVA_API_PORT:-8100}:8100"
+    volumes:
+      - riva_storage:/data/storage
+      - riva_models:/root/.cache
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    profiles: ["app"]
+    build:
+      context: ./backend
+    container_name: riva-worker
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-riva}:${POSTGRES_PASSWORD:-riva_dev_password}@db:5432/${POSTGRES_DB:-riva}
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_DIR: /data/storage
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - riva_storage:/data/storage
+      - riva_models:/root/.cache
+    depends_on:
+      backend:
+        condition: service_started
+
+  frontend:
+    profiles: ["app"]
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8100}
+    container_name: riva-frontend
+    ports:
+      - "${RIVA_WEB_PORT:-3000}:3000"
+    depends_on:
+      - backend
+
+volumes:
+  riva_pgdata:
+  riva_storage:
+  riva_models:

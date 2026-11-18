@@ -1,0 +1,500 @@
+"""End-to-end API tests against a real PostgreSQL + pgvector database.
+
+Real: FastAPI app, auth, uploads, extraction/OCR, chunking, FastEmbed embeddings, pgvector, BM25 in SQL,
+RRF, cross-encoder reranking, LangGraph workflow, SSE streaming, persistence, analytics.
+Scripted: only the chat LLM (tests/fakes.py), because no API key is available in CI.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+
+from app.rag.prompts import INSUFFICIENT_MESSAGE
+from tests import docgen
+from tests.conftest import drain_jobs, parse_sse, register, upload
+
+HANDBOOK = b"""# Northwind Handbook
+
+## Vacation
+Employees receive 26 days of paid vacation every year. Unused days expire on 31 March.
+
+## Hardware
+Each employee receives a laptop. Contract INV-2024-0042 covers hardware insurance for all laptops.
+
+## Security
+Lost devices must be reported to the security desk within four hours.
+"""
+
+TRAVEL = b"""Travel Guidelines
+
+Train travel is preferred for trips shorter than five hours. Flights require manager approval.
+Hotel costs are reimbursed up to 160 euros per night.
+"""
+
+
+@pytest.fixture(scope="module")
+async def alice(client_factory):
+    client = await client_factory()
+    info = await register(client, "alice")
+    result = await upload(client, {"handbook.md": HANDBOOK, "travel.txt": TRAVEL})
+    assert len(result["uploaded"]) == 2
+    return {"client": client, "info": info, "docs": {d["filename"]: d["id"] for d in result["uploaded"]}}
+
+
+async def chat_stream(client, **body) -> tuple[list[tuple[str, dict]], dict]:
+    r = await client.post("/api/chat/stream", json=body)
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("text/event-stream")
+    events = parse_sse(r.text)
+    done = next((d for e, d in events if e == "done"), None)
+    assert done is not None, events
+    return events, done["message"]
+
+
+# ── Auth ────────────────────────────────────────────────────────────────────
+
+async def test_auth_required_and_login(client_factory):
+    c = await client_factory()
+    assert (await c.get("/api/documents")).status_code == 401
+    info = await register(c, "bob")
+    c.headers.pop("Authorization")
+    bad = await c.post("/api/auth/login", json={"email": info["user"]["email"], "password": "wrong-password"})
+    assert bad.status_code == 401 and bad.json()["error"]["code"] == "unauthorized"
+    ok = await c.post("/api/auth/login", json={"email": info["user"]["email"], "password": "correct-horse-1"})
+    assert ok.status_code == 200 and "riva_session" in ok.cookies
+    me = await c.get("/api/auth/me", cookies={"riva_session": ok.cookies["riva_session"]})
+    assert me.status_code == 200 and me.json()["workspace"]["role"] == "admin" and me.json()["access"]["clearance"] == "restricted"
+
+
+async def test_duplicate_email_rejected(client_factory):
+    c = await client_factory()
+    info = await register(c, "dup")
+    r = await c.post("/api/auth/register", json={"email": info["user"]["email"], "password": "another-pass-1"})
+    assert r.status_code == 409
+
+
+# ── Documents ───────────────────────────────────────────────────────────────
+
+async def test_upload_all_formats_and_index(client_factory):
+    c = await client_factory()
+    await register(c, "formats")
+    files = {
+        "report.pdf": docgen.pdf_bytes([["Quarterly revenue reached 4.2 million euros in the third quarter."],
+                                        ["Customer churn fell to 3 percent after the loyalty program launch."]]),
+        "scan.pdf": docgen.scanned_pdf_bytes(["PURCHASE ORDER 55190", "Supplier Lumen Parts", "Total 980 EUR"]),
+        "travel.docx": docgen.docx_bytes(), "deck.pptx": docgen.pptx_bytes(), "inventory.xlsx": docgen.xlsx_bytes(),
+        "sales.csv": docgen.CSV, "guide.html": docgen.HTML, "runbook.md": docgen.MARKDOWN, "notes.txt": docgen.TEXT,
+    }
+    result = await upload(c, files)
+    assert len(result["uploaded"]) == len(files) and not result["rejected"]
+    docs = (await c.get("/api/documents")).json()
+    by_name = {d["filename"]: d for d in docs}
+    assert all(d["status"] == "indexed" and d["chunk_count"] > 0 for d in docs), [
+        (d["filename"], d["status"], d["error_message"]) for d in docs]
+    assert by_name["report.pdf"]["page_count"] == 2 and by_name["deck.pptx"]["page_count"] == 2
+    assert by_name["scan.pdf"]["metadata"]["ocr_pages"] == [1]
+    chunks = (await c.get(f"/api/documents/{by_name['scan.pdf']['id']}/chunks")).json()
+    assert "55190" in " ".join(ch["content"] for ch in chunks["items"])
+    pdf_chunks = (await c.get(f"/api/documents/{by_name['report.pdf']['id']}/chunks")).json()["items"]
+    assert {ch["page_number"] for ch in pdf_chunks} <= {1, 2}
+    job = by_name["report.pdf"]["job"]
+    assert job["status"] == "completed" and job["progress"] == 100 and job["stats"]["timings"]["total_s"] > 0
+
+
+async def test_duplicates_and_rejections(alice):
+    c = alice["client"]
+    r = await c.post("/api/documents/upload", files=[("files", ("copy.md", HANDBOOK)),
+                                                     ("files", ("virus.exe", b"MZ")),
+                                                     ("files", ("fake.pdf", b"hello"))])
+    body = r.json()
+    assert body["uploaded"] == []
+    assert body["duplicates"][0]["existing_document_id"] == alice["docs"]["handbook.md"]
+    assert {x["filename"] for x in body["rejected"]} == {"virus.exe", "fake.pdf"}
+
+
+async def test_upload_size_limit(client_factory, monkeypatch):
+    from app.core.config import get_settings
+
+    c = await client_factory()
+    await register(c, "big")
+    monkeypatch.setattr(get_settings(), "max_upload_mb", 1)
+    r = await c.post("/api/documents/upload", files=[("files", ("big.txt", b"a" * (1024 * 1024 + 10)))])
+    assert r.json()["rejected"][0]["reason"].startswith("File exceeds")
+
+
+# ── Retrieval ───────────────────────────────────────────────────────────────
+
+async def _retrieve(ws_id, query, mode, rerank=False):
+    from app.core.timing import StageTimer
+    from app.retrieval.hybrid import HybridRetriever
+    from app.retrieval.types import RetrievalScope
+    from app.schemas.settings import RetrievalSettings
+
+    cfg = RetrievalSettings(mode=mode, top_k=10, final_k=3, reranker_enabled=rerank)
+    timer = StageTimer()
+    out = await HybridRetriever().retrieve(query=query, search_queries=[query],
+                                           scope=RetrievalScope(workspace_id=uuid.UUID(ws_id)), cfg=cfg, timer=timer)
+    return out, timer
+
+
+async def test_bm25_exact_identifier_and_dense_semantic(alice):
+    ws = alice["info"]["workspace"]["id"]
+    bm25, _ = await _retrieve(ws, "INV-2024-0042", "bm25")
+    assert bm25.selected and "INV-2024-0042" in bm25.selected[0].content
+    assert bm25.selected[0].bm25_score > 0 and bm25.selected[0].dense_rank is None
+    dense, _ = await _retrieve(ws, "time off allowance per year", "dense")
+    assert "26 days of paid vacation" in dense.selected[0].content
+    assert 0 < dense.selected[0].dense_score <= 1
+
+
+async def test_hybrid_fusion_and_rerank_record_all_ranks_and_timings(alice):
+    ws = alice["info"]["workspace"]["id"]
+    out, timer = await _retrieve(ws, "How much are hotel costs reimbursed per night?", "hybrid", rerank=True)
+    top = out.selected[0]
+    assert "160 euros per night" in top.context_text
+    assert top.fused_rank is not None and top.rrf_score > 0 and top.rerank_score is not None
+    assert out.config["reranker_applied"] is True
+    for stage in ("embedding", "dense_retrieval", "bm25_retrieval", "fusion", "reranking", "context_preparation"):
+        assert stage in timer.stages, stage
+
+
+async def test_bm25_stopword_only_query_returns_nothing(alice):
+    out, _ = await _retrieve(alice["info"]["workspace"]["id"], "the and of", "bm25")
+    assert out.selected == []
+
+
+# ── Chat ────────────────────────────────────────────────────────────────────
+
+async def test_chat_stream_full_lifecycle(alice):
+    c = alice["client"]
+    events, msg = await chat_stream(c, message="How many days of paid vacation do employees receive?")
+    names = [e for e, _ in events]
+    assert names[0] == "meta" and names[-1] == "done"
+    assert "status" in names and "retrieval" in names and "token" in names
+    assert names.index("retrieval") < names.index("token"), "sources are sent before the answer streams"
+    streamed = "".join(d["delta"] for e, d in events if e == "token")
+    assert "26 days" in streamed
+
+    assert msg["status"] == "completed" and "26 days" in msg["content"]
+    assert msg["citations"] and msg["citations"][0]["document_name"] == "Northwind Handbook"
+    assert msg["citations"][0]["document_id"] == alice["docs"]["handbook.md"]
+    assert "[1]" in msg["content"]
+
+    perf = msg["performance"]
+    assert perf["total_ms"] > 0 and perf["time_to_first_token_ms"] is not None
+    assert perf["time_to_first_token_ms"] <= perf["total_ms"]
+    for stage in ("query_processing", "embedding", "dense_retrieval", "bm25_retrieval", "fusion", "reranking",
+                  "relevance_grading", "llm_generation", "answer_verification"):
+        assert stage in perf["stages_ms"], stage
+    assert perf["prompt_tokens"] and perf["llm_calls"] >= 1
+
+    retrieval = msg["retrieval"]
+    selected = [s for s in retrieval["sources"] if s["selected"]]
+    assert selected and selected[0]["content"] and retrieval["retrieval_success"] is True
+    assert msg["verification"]["status"] == "completed" and msg["verification"]["grounded"] is True
+
+    # No evaluator key in tests → every RAGAS metric is N/A with a reason, never 0.
+    ev = msg["evaluations"][0]
+    assert ev["framework"] == "ragas" and ev["status"] == "not_available"
+    assert all(m["score"] is None and m["score_100"] is None and m["reason"] for m in ev["metrics"])
+    assert {m["name"] for m in ev["metrics"]} >= {"faithfulness", "answer_relevancy", "context_precision",
+                                                  "context_recall", "answer_correctness", "context_entity_recall",
+                                                  "noise_sensitivity"}
+    noise = next(m for m in ev["metrics"] if m["name"] == "noise_sensitivity")
+    assert noise["higher_is_better"] is False
+
+
+async def test_unanswerable_question_uses_corrective_rag_then_refuses(alice):
+    events, msg = await chat_stream(alice["client"], message="What is the share price of Contoso on the Tokyo exchange?")
+    assert msg["status"] == "insufficient_context"
+    assert msg["content"] == INSUFFICIENT_MESSAGE
+    assert msg["citations"] == []
+    assert msg["retrieval"]["attempts"] == 2, "one corrective retry with a rewritten query"
+    assert len(msg["retrieval"]["search_queries"]) >= 2
+    assert "query_rewriting" in msg["performance"]["stages_ms"]
+    assert msg["evaluations"][0]["status"] == "not_available"
+
+
+async def test_follow_up_question_uses_conversation_memory(alice):
+    c = alice["client"]
+    _, first = await chat_stream(c, message="What does contract INV-2024-0042 cover?")
+    assert "hardware insurance" in first["content"]
+    _, second = await chat_stream(c, message="Which devices does it apply to?",
+                                  conversation_id=first["conversation_id"])
+    assert second["metadata"]["standalone_query"] != "Which devices does it apply to?"
+    assert second["status"] == "completed" and "laptops" in second["content"]
+    detail = (await c.get(f"/api/conversations/{first['conversation_id']}")).json()
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant", "user", "assistant"]
+
+
+async def test_multi_document_question_cites_both(alice):
+    _, msg = await chat_stream(alice["client"],
+                               message="What are the rules for reporting lost devices and for hotel costs per night?")
+    cited = {c["document_name"] for c in msg["citations"]}
+    assert cited == {"Northwind Handbook", "travel"}
+
+
+async def test_grader_sees_facts_deep_inside_long_chunks(client_factory):
+    """Regression: the relevance grader used to see only the first 900 characters of each passage."""
+    c = await client_factory()
+    await register(c, "longchunk")
+    filler = "The committee reviewed general topics during the annual meeting and agreed on minor edits. " * 30
+    doc = (filler + "\n\nThe warranty period for the Falcon drone is 30 months from delivery.").encode()
+    assert len(doc) > 2500
+    await upload(c, {"minutes.txt": doc})
+    chunks = (await c.get("/api/documents")).json()[0]["chunk_count"]
+    assert chunks == 1, "fact and filler must share one chunk for this regression test"
+    _, msg = await chat_stream(c, message="What is the warranty period for the Falcon drone?")
+    assert msg["status"] == "completed" and "30 months" in msg["content"]
+
+
+async def test_document_scope_restricts_retrieval(alice):
+    _, msg = await chat_stream(alice["client"], message="How much are hotel costs reimbursed per night?",
+                               document_ids=[alice["docs"]["handbook.md"]])
+    assert all(s["document_name"] == "Northwind Handbook" for s in msg["retrieval"]["sources"])
+    assert msg["status"] == "insufficient_context"
+
+
+async def test_small_talk_skips_retrieval(alice):
+    events, msg = await chat_stream(alice["client"], message="hello")
+    assert msg["retrieval"] is None and msg["status"] == "completed"
+    assert msg["evaluations"][0]["status"] == "not_available"
+
+
+async def test_regenerate_replaces_last_answer(alice):
+    c = alice["client"]
+    _, msg = await chat_stream(c, message="When do unused vacation days expire?")
+    _, again = await chat_stream(c, message="(regenerate)", conversation_id=msg["conversation_id"], regenerate=True)
+    assert again["id"] != msg["id"] and "31 March" in again["content"]
+    detail = (await c.get(f"/api/conversations/{msg['conversation_id']}")).json()
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
+
+
+async def test_non_streaming_chat_and_feedback_and_export(alice):
+    c = alice["client"]
+    r = await c.post("/api/chat", json={"message": "Who must lost devices be reported to?"})
+    assert r.status_code == 200
+    body = r.json()
+    mid = body["assistant_message"]["id"]
+    assert (await c.post(f"/api/messages/{mid}/feedback", json={"rating": 1})).status_code == 200
+    msg = (await c.get(f"/api/messages/{mid}")).json()
+    assert msg["feedback_rating"] == 1
+    export = await c.get(f"/api/conversations/{body['conversation_id']}/export?format=markdown")
+    assert export.status_code == 200 and "security desk" in export.text and "**Sources**" in export.text
+    found = (await c.get("/api/conversations?q=lost devices")).json()
+    assert any(conv["id"] == body["conversation_id"] for conv in found)
+
+
+async def test_unknown_model_rejected(alice):
+    r = await alice["client"].post("/api/chat/stream", json={"message": "hi", "model": "not-a-model"})
+    assert r.status_code == 422
+
+
+# ── Tenant isolation ────────────────────────────────────────────────────────
+
+async def test_tenant_isolation(alice, client_factory):
+    mallory = await client_factory()
+    await register(mallory, "mallory")
+    doc_id = alice["docs"]["handbook.md"]
+    assert (await mallory.get(f"/api/documents/{doc_id}")).status_code == 404
+    assert (await mallory.get(f"/api/documents/{doc_id}/file")).status_code == 404
+    assert (await mallory.delete(f"/api/documents/{doc_id}")).status_code == 404
+    assert (await mallory.get("/api/documents")).json() == []
+    r = await mallory.post("/api/chat/stream", json={"message": "vacation days?", "document_ids": [doc_id]})
+    assert r.status_code == 404
+    _, msg = await chat_stream(mallory, message="How many days of paid vacation do employees receive?")
+    assert msg["status"] == "insufficient_context" and msg["citations"] == []
+    convs = (await alice["client"].get("/api/conversations")).json()
+    assert (await mallory.get(f"/api/conversations/{convs[0]['id']}")).status_code == 404
+    # Switching workspace via header requires membership.
+    r = await mallory.get("/api/documents", headers={"X-Workspace-Id": alice["info"]["workspace"]["id"]})
+    assert r.status_code == 403
+
+
+# ── Versions, reindex, delete ───────────────────────────────────────────────
+
+async def test_versions_reindex_and_delete(client_factory):
+    c = await client_factory()
+    await register(c, "versions")
+    doc = (await upload(c, {"policy.md": b"# Policy\n\nThe office opens at 08:00."}))["uploaded"][0]
+    r = await c.post(f"/api/documents/{doc['id']}/versions",
+                     files={"file": ("policy.md", b"# Policy\n\nThe office opens at 09:30 on weekdays.")})
+    assert r.status_code == 201 and r.json()["current_version"] == 2
+    await drain_jobs()
+    detail = (await c.get(f"/api/documents/{doc['id']}")).json()
+    assert detail["status"] == "indexed" and [v["version"] for v in detail["versions"]] == [2, 1]
+    chunks = (await c.get(f"/api/documents/{doc['id']}/chunks")).json()["items"]
+    assert all(ch["document_version"] == 2 for ch in chunks) and "09:30" in chunks[0]["content"]
+
+    r = await c.post(f"/api/documents/{doc['id']}/reindex")
+    assert r.status_code == 200 and r.json()["status"] == "updating"
+    assert (await c.post(f"/api/documents/{doc['id']}/reindex")).status_code == 409
+    await drain_jobs()
+    assert (await c.get(f"/api/documents/{doc['id']}")).json()["status"] == "indexed"
+
+    assert (await c.delete(f"/api/documents/{doc['id']}")).status_code == 200
+    assert (await c.get(f"/api/documents/{doc['id']}")).status_code == 404
+    from sqlalchemy import func, select
+
+    from app.database.session import session_scope
+    from app.models import DocumentChunk
+
+    async with session_scope() as s:
+        left = await s.scalar(select(func.count()).select_from(DocumentChunk)
+                              .where(DocumentChunk.document_id == uuid.UUID(doc["id"])))
+    assert left == 0
+
+
+async def test_failed_document_is_marked_failed_without_retry_loop(client_factory):
+    c = await client_factory()
+    await register(c, "failing")
+    # Valid PDF header but no extractable text and OCR finds nothing → permanent failure.
+    doc = (await upload(c, {"blank.pdf": docgen.blank_pdf_bytes()}))["uploaded"][0]
+    detail = (await c.get(f"/api/documents/{doc['id']}")).json()
+    assert detail["status"] == "failed" and "No extractable text" in detail["error_message"]
+    assert detail["job"]["status"] == "failed" and detail["job"]["attempts"] == 1
+
+
+async def test_collections_and_settings(client_factory):
+    c = await client_factory()
+    await register(c, "settings")
+    col = (await c.post("/api/collections", json={"name": "Legal"})).json()
+    assert (await c.post("/api/collections", json={"name": "Legal"})).status_code == 409
+    doc = (await upload(c, {"msa.txt": b"The liability cap is 2 million euros."}, collection_id=col["id"]))["uploaded"][0]
+    assert doc["collection_id"] == col["id"]
+    assert (await c.get("/api/collections")).json()[0]["document_count"] == 1
+    s = (await c.get("/api/settings")).json()
+    s["retrieval"]["top_k"] = 12
+    s["chunking"]["strategy"] = "parent_child"
+    assert (await c.put("/api/settings", json=s)).json()["retrieval"]["top_k"] == 12
+    bad = {**s, "chunking": {**s["chunking"], "chunk_overlap": 5000}}
+    assert (await c.put("/api/settings", json=bad)).status_code == 422
+    # Parent-child strategy applies on re-index and retrieval returns parent context.
+    await c.post(f"/api/documents/{doc['id']}/reindex")
+    await drain_jobs()
+    _, msg = await chat_stream(c, message="What is the liability cap?", collection_id=col["id"])
+    assert "2 million euros" in msg["content"]
+
+
+# ── Evaluation persistence (evaluator patched: real RAGAS needs an API key) ──
+
+async def test_online_evaluation_pipeline_persists_scores(alice, monkeypatch):
+    from app.core.config import get_settings
+    from app.evaluation import ragas_evaluator
+    from app.evaluation.types import MetricOutcome
+    from app.worker import process_next_evaluation
+
+    captured = {}
+
+    async def fake_evaluate(self, question, answer, contexts, reference=None):
+        captured.update(question=question, answer=answer, contexts=contexts, reference=reference)
+        return [MetricOutcome("faithfulness", "Faithfulness", True, False, "completed", score=0.9),
+                MetricOutcome("context_recall", "Context Recall", True, True,
+                              "completed" if reference else "not_applicable",
+                              score=0.75 if reference else None, reason=None if reference else "needs reference"),
+                MetricOutcome("noise_sensitivity", "Noise Sensitivity", False, True, "failed", reason="boom")]
+
+    monkeypatch.setattr(ragas_evaluator.RagasEvaluator, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setattr(ragas_evaluator.RagasEvaluator, "evaluate", fake_evaluate)
+    monkeypatch.setattr(get_settings(), "openai_api_key", "sk-test-not-used")  # mark evaluator as configured
+    c = alice["client"]
+    _, msg = await chat_stream(c, message="How many days of paid vacation do employees receive?")
+    assert msg["evaluations"][0]["status"] == "pending"
+    assert await process_next_evaluation()
+    ev = (await c.get(f"/api/evaluations/{msg['id']}")).json()["evaluations"][0]
+    assert ev["status"] == "completed" and ev["mode"] == "online" and ev["duration_ms"] is not None
+    scores = {m["name"]: m for m in ev["metrics"]}
+    assert scores["faithfulness"]["score_100"] == 90
+    assert scores["context_recall"]["score"] is None and scores["context_recall"]["status"] == "not_applicable"
+    assert scores["noise_sensitivity"]["status"] == "failed" and scores["noise_sensitivity"]["score"] is None
+    assert captured["contexts"] and "26 days" in captured["answer"]
+    # Evaluation time is never part of the answer latency.
+    assert msg["performance"]["total_ms"] == (await c.get(f"/api/messages/{msg['id']}")).json()["performance"]["total_ms"]
+
+    r = await c.post(f"/api/evaluations/{msg['id']}/reference", json={"reference_answer": "26 days per year."})
+    assert r.status_code == 200 and r.json()["evaluations"][0]["mode"] == "reference"
+    assert await process_next_evaluation()
+    latest = (await c.get(f"/api/evaluations/{msg['id']}")).json()["evaluations"][0]
+    assert latest["reference_available"] and next(m for m in latest["metrics"]
+                                                 if m["name"] == "context_recall")["score_100"] == 75
+    raw = (await c.get(f"/api/evaluations/{msg['id']}/raw")).json()
+    assert raw[0]["inputs"]["reference"] == "26 days per year."
+
+
+async def test_evaluation_failure_never_breaks_chat(alice, monkeypatch):
+    from app.core.config import get_settings
+    from app.evaluation import ragas_evaluator
+    from app.worker import process_next_evaluation
+
+    def boom(self, *a, **k):
+        raise RuntimeError("evaluator offline")
+
+    monkeypatch.setattr(ragas_evaluator.RagasEvaluator, "__init__", boom)
+    monkeypatch.setattr(get_settings(), "openai_api_key", "sk-test-not-used")
+    _, msg = await chat_stream(alice["client"], message="When do unused vacation days expire?")
+    assert msg["status"] == "completed"
+    assert await process_next_evaluation()
+    ev = (await alice["client"].get(f"/api/evaluations/{msg['id']}")).json()["evaluations"][0]
+    assert ev["status"] == "failed" and "evaluator offline" in ev["error"]
+    assert all(m["score"] is None for m in ev["metrics"])
+
+
+# ── Analytics & health ──────────────────────────────────────────────────────
+
+async def test_analytics_reflect_persisted_records(alice):
+    c = alice["client"]
+    ov = (await c.get("/api/analytics/overview")).json()
+    assert ov["totals"]["documents_indexed"] == 2
+    assert ov["totals"]["questions_answered"] >= 8 and ov["totals"]["insufficient_context_answers"] >= 1
+    assert ov["latency"]["avg_total_ms"] > 0 and ov["latency"]["p95_total_ms"] >= ov["latency"]["p50_total_ms"]
+    assert 0 <= ov["retrieval"]["success_rate"] <= 1 and ov["tokens"]["total_tokens"] > 0
+    assert ov["tokens"]["estimated_cost_usd"] is None and ov["tokens"]["pricing_configured"] is False
+    assert ov["quality"]["thumbs_up"] >= 1
+    perf = (await c.get("/api/analytics/performance")).json()
+    assert perf["series"] and "llm_generation" in perf["stage_averages_ms"]
+    evals = (await c.get("/api/analytics/evaluations")).json()
+    assert evals["status_counts"]
+    empty = (await c.get("/api/analytics/overview?date_from=2001-01-01&date_to=2001-01-02")).json()
+    assert empty["totals"]["questions_answered"] == 0 and empty["latency"]["avg_total_ms"] is None
+
+
+async def test_health(client_factory):
+    c = await client_factory()
+    r = await c.get("/api/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["database"] == "ok" and body["pgvector"].startswith("ok") and body["migrations"] == "0002"
+
+
+async def test_rate_limit(alice, monkeypatch):
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "rate_limit_enabled", True)
+    monkeypatch.setattr(get_settings(), "rate_limit_upload_per_minute", 1)
+    c = alice["client"]
+    codes = [(await c.post("/api/documents/upload", files=[("files", (f"r{i}.txt", f"rate {i} {uuid.uuid4()}".encode()))]
+                           )).status_code for i in range(3)]
+    assert 429 in codes
+    await drain_jobs()
+
+
+# ── Benchmark (retrieval comparison needs no LLM) ───────────────────────────
+
+@pytest.mark.slow
+async def test_retrieval_benchmark_compares_four_modes():
+    from app.evaluation.benchmark import create_run, ensure_benchmark_workspace, execute_benchmark_run
+
+    ws = await ensure_benchmark_workspace("sample_benchmark")
+    run = await create_run(ws, "retrieval", "sample_benchmark", limit=None, label="pytest",
+                           retrieval_modes=["dense", "bm25", "hybrid", "hybrid_rerank"], set_baseline=True)
+    done = await execute_benchmark_run(run.id)
+    assert done.status == "completed", done.error
+    summary = done.summary["retrieval"]
+    assert set(summary) == {"dense", "bm25", "hybrid", "hybrid_rerank"}
+    for metrics in summary.values():
+        assert metrics["items"] == 19  # unanswerable item is unjudgeable
+        assert 0 <= metrics["recall@5"] <= 1 and 0 <= metrics["mrr"] <= 1
+    assert summary["hybrid_rerank"]["hit@5"] >= 0.8
+    assert done.report_paths["json"].endswith(".json") and done.report_paths["csv"].endswith(".csv")

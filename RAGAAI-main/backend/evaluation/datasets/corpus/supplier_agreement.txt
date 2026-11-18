@@ -1,0 +1,23 @@
+MASTER SUPPLY AGREEMENT
+
+Agreement ID: MSA-2025-117
+Parties: Halcyon Robotics GmbH ("Buyer") and Vireo Precision Components Ltd. ("Supplier")
+Effective date: 3 March 2025
+
+1. Scope. The Supplier will manufacture and deliver harmonic drive gearboxes, part number HD-58, for use in the Kestrel product line.
+
+2. Pricing. The unit price for HD-58 gearboxes is 312 euros for annual volumes up to 5,000 units and 289 euros for volumes above 5,000 units. Prices are fixed until 31 December 2026.
+
+3. Payment terms. The Buyer shall pay each invoice within 45 days of the invoice date. Late payments accrue interest at 2 percent per month.
+
+4. Delivery. The Supplier shall deliver within 6 weeks of each purchase order. If a delivery is more than 10 business days late, the Buyer is entitled to a credit of 1.5 percent of the order value per late week, capped at 15 percent.
+
+5. Quality. The accepted defect rate is at most 0.2 percent per shipment. Shipments exceeding this rate may be rejected in full at the Supplier's cost.
+
+6. Liability. Except for cases of gross negligence or wilful misconduct, each party's total liability under this agreement is limited to the total amounts paid in the preceding 12 months.
+
+7. Term and termination. The agreement runs for an initial term of three years and renews automatically for one-year periods. Either party may terminate for convenience with 90 days' written notice. Either party may terminate immediately for material breach that is not cured within 30 days.
+
+8. Confidentiality. Both parties keep confidential information secret for five years after termination.
+
+9. Governing law. This agreement is governed by the laws of Austria, with exclusive jurisdiction of the courts of Vienna.
